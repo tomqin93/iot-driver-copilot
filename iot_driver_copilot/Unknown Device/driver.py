@@ -7,7 +7,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configuration from environment variables
 HTTP_HOST = os.getenv('HTTP_HOST', '0.0.0.0')
-HTTP_PORT = int(os.getenv('HTTP_PORT', '8080'))
 
 # Sensor Data Simulation (since protocol and device communication are unknown)
 class SensorDataSimulator:
