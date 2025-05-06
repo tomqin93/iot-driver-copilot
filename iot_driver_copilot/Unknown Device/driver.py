@@ -3,86 +3,83 @@ import json
 import random
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configuration from environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+HTTP_HOST = os.getenv('HTTP_HOST', '0.0.0.0')
+HTTP_PORT = int(os.getenv('HTTP_PORT', '8080'))
 
-# Simulate reading from device (as protocol and API are unknown)
-# Data points: X, Y, Rz, 18°–44°, 55mm–135mm, 258.00mm, 110.00mm, 181mm, 0–65535
-DATA_POINTS = [
-    ('X', -1000.0, 1000.0),              # Example: X in mm
-    ('Y', -1000.0, 1000.0),              # Example: Y in mm
-    ('Rz', -180.0, 180.0),               # Example: Rotation in degrees
-    ('angle', 18.0, 44.0),               # Angle in degrees
-    ('zoom_mm', 55.0, 135.0),            # Zoom in mm
-    ('fixed1_mm', 258.00, 258.00),       # Fixed value
-    ('fixed2_mm', 110.00, 110.00),       # Fixed value
-    ('fixed3_mm', 181.00, 181.00),       # Fixed value
-    ('raw', 0, 65535),                   # Raw integer
-]
-
-class DeviceData:
+# Sensor Data Simulation (since protocol and device communication are unknown)
+class SensorDataSimulator:
     def __init__(self):
         self.lock = threading.Lock()
-        self.data = self._generate_fake_data()
+        self.data = self._generate_data()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._update_data, daemon=True)
+        self._thread.start()
 
-    def _generate_fake_data(self):
-        values = {}
-        for name, vmin, vmax in DATA_POINTS:
-            if vmin == vmax:
-                value = vmin
-            elif isinstance(vmin, float) or isinstance(vmax, float):
-                value = round(random.uniform(vmin, vmax), 2)
-            else:
-                value = random.randint(int(vmin), int(vmax))
-            values[name] = value
-        return values
+    def _generate_data(self):
+        return {
+            "X": round(random.uniform(-1000, 1000), 2),
+            "Y": round(random.uniform(-1000, 1000), 2),
+            "Rz": round(random.uniform(-180, 180), 2),
+            "angle_deg": round(random.uniform(18, 44), 2),               # 18°–44°
+            "length_min_mm": random.randint(55, 135),                    # 55mm–135mm
+            "length_fixed1_mm": 258.00,
+            "length_fixed2_mm": 110.00,
+            "length_fixed3_mm": 181.00,
+            "range_value": random.randint(0, 65535)
+        }
 
-    def refresh(self):
-        with self.lock:
-            self.data = self._generate_fake_data()
+    def _update_data(self):
+        while not self._stop_event.is_set():
+            with self.lock:
+                self.data = self._generate_data()
+            time.sleep(1)  # simulate new sensor data every second
 
     def get_data(self):
         with self.lock:
             return dict(self.data)
 
-device_data = DeviceData()
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join()
 
-def device_data_refresher():
-    while True:
-        device_data.refresh()
-        time.sleep(1)  # Simulate real-time sensor reading
+simulator = SensorDataSimulator()
 
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+# HTTP Handler
+class SensorHTTPRequestHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200, content_type='application/json'):
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
     def do_GET(self):
         if self.path == '/read':
-            data = device_data.get_data()
-            response = {
-                "device_name": "Unknown Device",
-                "device_model": "part1(4#), part2(3#), part3(14#)",
-                "manufacturer": "Unknown",
-                "device_type": "Sensor",
+            data = simulator.get_data()
+            self._set_headers()
+            self.wfile.write(json.dumps({
+                "status": "ok",
                 "data": data
-            }
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Cache-Control', 'no-cache')
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode('utf-8'))
+            }).encode('utf-8'))
         else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 Not Found')
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not found"}).encode('utf-8'))
 
     def log_message(self, format, *args):
-        return  # Suppress default HTTP logging
+        return  # Suppress default logging
+
+def run():
+    server_address = (HTTP_HOST, HTTP_PORT)
+    httpd = HTTPServer(server_address, SensorHTTPRequestHandler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        simulator.stop()
+        httpd.server_close()
 
 if __name__ == '__main__':
-    t = threading.Thread(target=device_data_refresher, daemon=True)
-    t.start()
-    server = HTTPServer((SERVER_HOST, SERVER_PORT), SimpleHTTPRequestHandler)
-    print(f"Sensor HTTP server running at http://{SERVER_HOST}:{SERVER_PORT}/read")
-    server.serve_forever()
+    run()
