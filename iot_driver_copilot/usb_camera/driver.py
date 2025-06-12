@@ -1,164 +1,169 @@
 import os
+import json
 import threading
-import cv2
 import time
-from flask import Flask, Response, request, jsonify
+import base64
+import queue
+from typing import Callable, Optional
 
-# Configuration from environment variables
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-CAMERA_INDEX = int(os.environ.get("USB_CAMERA_INDEX", "0"))
-DEFAULT_RESOLUTION = os.environ.get("USB_CAMERA_RESOLUTION", "640x480")
+import paho.mqtt.client as mqtt
 
-# Helper to parse resolution string "WIDTHxHEIGHT"
-def parse_resolution(res_str):
-    try:
-        w, h = res_str.lower().split("x")
-        return int(w), int(h)
-    except Exception:
-        return 640, 480
+class USBCameraMQTTDriver:
+    def __init__(self):
+        self.broker_address = os.environ.get("MQTT_BROKER_ADDRESS")
+        if not self.broker_address:
+            raise EnvironmentError("MQTT_BROKER_ADDRESS environment variable is required")
+        self.client_id = os.environ.get("MQTT_CLIENT_ID", "usb_camera_shifu")
+        self.username = os.environ.get("MQTT_USERNAME")
+        self.password = os.environ.get("MQTT_PASSWORD")
+        self.keepalive = int(os.environ.get("MQTT_KEEPALIVE", 60))
+        self._client = mqtt.Client(client_id=self.client_id, clean_session=True)
+        if self.username:
+            self._client.username_pw_set(self.username, self.password)
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+        self._client.on_message = self._on_message
+        self._subscriptions = {}
+        self._msg_queues = {}
+        self._connect_lock = threading.Lock()
+        self._connected = threading.Event()
+        self._connect()
+        self._listen_thread = threading.Thread(target=self._loop_forever, daemon=True)
+        self._listen_thread.start()
 
-class USBCameraManager:
-    def __init__(self, camera_index, default_resolution):
-        self.camera_index = camera_index
-        self.width, self.height = parse_resolution(default_resolution)
-        self.capture = None
-        self.lock = threading.Lock()
-        self.is_streaming = False
-        self.frame = None
-        self._thread = None
-        self.brightness = None
-        self.contrast = None
+    def _connect(self):
+        with self._connect_lock:
+            if not self._connected.is_set():
+                self._client.connect(self.broker_address.split(':')[0], int(self.broker_address.split(':')[1]), self.keepalive)
 
-    def start_capture(self):
-        with self.lock:
-            if self.is_streaming:
-                return True
-            self.capture = cv2.VideoCapture(self.camera_index)
-            if not self.capture.isOpened():
-                self.capture = None
-                return False
-            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            if self.brightness is not None:
-                self.capture.set(cv2.CAP_PROP_BRIGHTNESS, self.brightness)
-            if self.contrast is not None:
-                self.capture.set(cv2.CAP_PROP_CONTRAST, self.contrast)
-            self.is_streaming = True
-            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-            self._thread.start()
-            return True
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._connected.set()
+        else:
+            self._connected.clear()
 
-    def _capture_loop(self):
-        while self.is_streaming and self.capture and self.capture.isOpened():
-            ret, frame = self.capture.read()
-            if not ret:
-                continue
-            with self.lock:
-                self.frame = frame
-            time.sleep(0.01)
-        with self.lock:
-            self.is_streaming = False
+    def _on_disconnect(self, client, userdata, rc):
+        self._connected.clear()
+
+    def _loop_forever(self):
+        while True:
+            try:
+                self._client.loop_forever()
+            except Exception:
+                time.sleep(2)
+                self._connect()
+
+    def _on_message(self, client, userdata, msg):
+        if msg.topic in self._subscriptions:
+            callback = self._subscriptions[msg.topic]
+            try:
+                payload = json.loads(msg.payload.decode())
+            except Exception:
+                payload = msg.payload
+            callback(payload)
+        if msg.topic in self._msg_queues:
+            try:
+                self._msg_queues[msg.topic].put_nowait(msg)
+            except Exception:
+                pass
+
+    # ========== SUBSCRIBE ==========
+
+    def subscribe_to_audio_stream(self, callback: Callable[[dict], None]):
+        """
+        Subscribe to the audio stream telemetry.
+        Payload: { audio_data: base64, timestamp: ... }
+        """
+        topic = "device/camera/audio"
+        self._subscriptions[topic] = callback
+        self._client.subscribe(topic, qos=1)
+
+    def subscribe_to_video_stream(self, callback: Callable[[dict], None]):
+        """
+        Subscribe to the video stream telemetry.
+        Payload: { video_frame: base64, timestamp: ..., format: ... }
+        """
+        topic = "device/camera/video"
+        self._subscriptions[topic] = callback
+        self._client.subscribe(topic, qos=1)
+
+    # ========== PUBLISH ==========
+
+    def adjust_resolution(self, width: int, height: int):
+        """
+        Publish a command to adjust camera resolution.
+        Payload: { "width": ..., "height": ... }
+        """
+        topic = "device/camera/resolution/adjust"
+        payload = {"width": width, "height": height}
+        self._client.publish(topic, json.dumps(payload), qos=1)
+
+    def start_capture(self, capture_mode: Optional[str] = None, duration: Optional[int] = None):
+        """
+        Publish command to start camera capture process.
+        Optional payload parameters: capture_mode, duration
+        """
+        topic = "device/camera/capture/start"
+        payload = {}
+        if capture_mode:
+            payload["capture_mode"] = capture_mode
+        if duration:
+            payload["duration"] = duration
+        self._client.publish(topic, json.dumps(payload), qos=1)
 
     def stop_capture(self):
-        with self.lock:
-            self.is_streaming = False
-            if self.capture:
-                self.capture.release()
-                self.capture = None
-            self.frame = None
+        """
+        Publish command to stop camera capture.
+        """
+        topic = "device/camera/capture/stop"
+        self._client.publish(topic, json.dumps({}), qos=1)
 
-    def get_frame(self):
-        with self.lock:
-            if self.frame is None:
-                return None
-            ret, jpeg = cv2.imencode('.jpg', self.frame)
-            if not ret:
-                return None
-            return jpeg.tobytes()
+    def adjust_brightness(self, brightness: int):
+        """
+        Publish command to adjust camera brightness.
+        Payload: { "brightness": ... }
+        """
+        topic = "device/camera/brightness/adjust"
+        payload = {"brightness": brightness}
+        self._client.publish(topic, json.dumps(payload), qos=1)
 
-    def set_brightness(self, value):
-        with self.lock:
-            self.brightness = value
-            if self.capture:
-                self.capture.set(cv2.CAP_PROP_BRIGHTNESS, value)
-            return True
+    def adjust_contrast(self, contrast: int):
+        """
+        Publish command to adjust camera contrast.
+        Payload: { "contrast": ... }
+        """
+        topic = "device/camera/contrast/adjust"
+        payload = {"contrast": contrast}
+        self._client.publish(topic, json.dumps(payload), qos=1)
 
-    def set_contrast(self, value):
-        with self.lock:
-            self.contrast = value
-            if self.capture:
-                self.capture.set(cv2.CAP_PROP_CONTRAST, value)
-            return True
+    # ========== FOR DEVICE SHIFU API ==========
 
-    def set_resolution(self, w, h):
-        with self.lock:
-            self.width, self.height = w, h
-            if self.capture:
-                self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-                self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            return True
+    # The following methods are for deviceShifu to call (they use the above under-the-hood)
 
-app = Flask(__name__)
-camera_manager = USBCameraManager(CAMERA_INDEX, DEFAULT_RESOLUTION)
+    def deviceShifu_subscribe_audio(self, user_callback: Callable[[dict], None]):
+        """DeviceShifu uses this to subscribe to audio stream"""
+        self.subscribe_to_audio_stream(user_callback)
 
-@app.route("/camera/start", methods=["POST"])
-def api_start_capture():
-    success = camera_manager.start_capture()
-    if success:
-        return jsonify({"status": "started"}), 200
-    else:
-        return jsonify({"status": "failed", "reason": "Could not open camera"}), 500
+    def deviceShifu_subscribe_video(self, user_callback: Callable[[dict], None]):
+        """DeviceShifu uses this to subscribe to video stream"""
+        self.subscribe_to_video_stream(user_callback)
 
-def gen_mjpeg_stream():
-    while camera_manager.is_streaming:
-        frame = camera_manager.get_frame()
-        if frame is not None:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        else:
-            time.sleep(0.05)
+    def deviceShifu_adjust_resolution(self, width: int, height: int):
+        """DeviceShifu API for adjusting resolution"""
+        self.adjust_resolution(width, height)
 
-@app.route("/camera/stream", methods=["GET"])
-def api_stream():
-    if not camera_manager.is_streaming:
-        return jsonify({"status": "failed", "reason": "Camera not streaming"}), 503
-    return Response(gen_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    def deviceShifu_start_capture(self, capture_mode: Optional[str] = None, duration: Optional[int] = None):
+        """DeviceShifu API for starting capture"""
+        self.start_capture(capture_mode, duration)
 
-@app.route("/camera/stop", methods=["POST"])
-def api_stop_capture():
-    camera_manager.stop_capture()
-    return jsonify({"status": "stopped"}), 200
+    def deviceShifu_stop_capture(self):
+        """DeviceShifu API for stopping capture"""
+        self.stop_capture()
 
-@app.route("/camera/brightness", methods=["PUT"])
-def api_set_brightness():
-    data = request.get_json(force=True)
-    if "brightness" not in data:
-        return jsonify({"status": "failed", "reason": "Missing brightness"}), 400
-    val = float(data["brightness"])
-    camera_manager.set_brightness(val)
-    return jsonify({"status": "ok", "brightness": val}), 200
+    def deviceShifu_adjust_brightness(self, brightness: int):
+        """DeviceShifu API for adjusting brightness"""
+        self.adjust_brightness(brightness)
 
-@app.route("/camera/contrast", methods=["PUT"])
-def api_set_contrast():
-    data = request.get_json(force=True)
-    if "contrast" not in data:
-        return jsonify({"status": "failed", "reason": "Missing contrast"}), 400
-    val = float(data["contrast"])
-    camera_manager.set_contrast(val)
-    return jsonify({"status": "ok", "contrast": val}), 200
-
-@app.route("/camera/res", methods=["PUT"])
-def api_set_resolution():
-    data = request.get_json(force=True)
-    if "resolution" not in data:
-        return jsonify({"status": "failed", "reason": "Missing resolution"}), 400
-    try:
-        w, h = parse_resolution(data["resolution"])
-        camera_manager.set_resolution(w, h)
-        return jsonify({"status": "ok", "resolution": f"{w}x{h}"}), 200
-    except Exception:
-        return jsonify({"status": "failed", "reason": "Invalid resolution format"}), 400
-
-if __name__ == "__main__":
-    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
+    def deviceShifu_adjust_contrast(self, contrast: int):
+        """DeviceShifu API for adjusting contrast"""
+        self.adjust_contrast(contrast)
