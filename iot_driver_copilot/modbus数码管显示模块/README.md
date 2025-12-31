@@ -1,0 +1,122 @@
+Modbus 7-Segment Display Module HTTP Driver
+
+Overview
+
+This driver connects to a Modbus RTU/ASCII 7‑segment display module (e.g., QX‑SEG34/QX‑SEG34B/QX‑SEG06) via serial Modbus and exposes an HTTP interface to control and observe the device. It actively polls the device state and provides endpoints to set display content and configuration without exposing the native Modbus protocol.
+
+Requirements
+
+- Python 3.9+
+- pymodbus Python package
+
+Install pymodbus:
+
+pip install pymodbus
+
+Environment Variables
+
+All configuration is via environment variables; no hard-coded values. The driver will exit if any required variable is missing.
+
+HTTP server
+- HTTP_HOST: HTTP bind address (e.g., 0.0.0.0)
+- HTTP_PORT: HTTP port (e.g., 8000)
+
+Serial/Modbus
+- MODBUS_METHOD: rtu or ascii
+- SERIAL_PORT: Serial device path (e.g., /dev/ttyUSB0, COM3)
+- SERIAL_BAUDRATE: Baud rate (e.g., 9600)
+- SERIAL_PARITY: N, E, or O
+- SERIAL_BYTESIZE: 7 or 8
+- SERIAL_STOPBITS: 1 or 2
+- MODBUS_TIMEOUT_MS: Request timeout in ms (e.g., 2000)
+- MODBUS_DEVICE_ID: Slave/unit ID of the display module (e.g., 1)
+
+Background polling and resilience
+- READ_POLL_INTERVAL_MS: Poll interval in ms (e.g., 500)
+- CONNECT_BACKOFF_MIN_MS: Minimum reconnect backoff in ms (e.g., 500)
+- CONNECT_BACKOFF_MAX_MS: Maximum reconnect backoff in ms (e.g., 10000)
+- OPERATION_RETRIES: Per-operation retry attempts (e.g., 3)
+
+Data packing
+- WORD_ORDER: high_first or low_first (word order when writing/reading 32‑bit values)
+
+Register addresses (required)
+- REG_DISPLAY_VALUE_ADDR: Base register address for display value
+- REG_DISPLAY_VALUE_TYPE: int16 | uint16 | int32 | uint32 | float32
+- REG_ASCII_BASE_ADDR: Base register address for 6 ASCII character registers
+- REG_MODE_ADDR: Register address for operating mode
+- REG_BLINK_MASK_ADDR: Register address for blink mask
+- REG_NUMERIC_TYPE_ADDR: Register address for numeric type
+- REG_DECIMAL_PLACES_ADDR: Register address for decimal places
+- REG_TARGET_SLAVE_ID_ADDR: Register address for mapping target slave id
+- REG_FUNCTION_CODE_ADDR: Register address for mapping function code
+- REG_TARGET_REGISTER_ADDR: Register address for mapping target register address
+- REG_TARGET_DATA_TYPE_ADDR: Register address for mapping target data type
+
+Optional mapping ranges (if you want ranges pushed to device)
+- REG_MAP_RANGES_BASE_ADDR: Base address where mapping ranges start
+- MAP_MAX_ENTRIES: Maximum entries to write; unused entries are cleared
+
+Run
+
+Set the environment variables above, then run:
+
+python driver.py
+
+HTTP API
+
+1) GET /status
+- Returns current module state, including: display_value, display_ascii_1_6, blink_mask, numeric_type, decimal_places, mode, target_slave_id, function_code, target_register_addr, target_data_type, connected, last_update_ts
+Example:
+
+curl -s http://$HTTP_HOST:$HTTP_PORT/status
+
+2) POST /display/value
+- Body: {"value": <number>}
+- Sets a numeric value shown on the display, using the configured REG_DISPLAY_VALUE_TYPE.
+Example:
+
+curl -s -X POST http://$HTTP_HOST:$HTTP_PORT/display/value -H 'Content-Type: application/json' -d '{"value":1234}'
+
+3) POST /display/ascii
+- Body: {"ascii": "ABCDEF"} (1–6 characters)
+- Sets up to six ASCII characters on the display.
+Example:
+
+curl -s -X POST http://$HTTP_HOST:$HTTP_PORT/display/ascii -H 'Content-Type: application/json' -d '{"ascii":"HELLO"}'
+
+4) PUT /mode
+- Body: {"mode": <int>}
+- Sets operating mode; value meaning depends on device configuration.
+Example:
+
+curl -s -X PUT http://$HTTP_HOST:$HTTP_PORT/mode -H 'Content-Type: application/json' -d '{"mode":1}'
+
+5) PUT /modbus/config
+- Body: {"target_slave_id":<int>, "function_code":<int>, "target_register_addr":<int>, "target_data_type":<int>}
+- Configures Modbus source used by the module for mapped display modes.
+Example:
+
+curl -s -X PUT http://$HTTP_HOST:$HTTP_PORT/modbus/config -H 'Content-Type: application/json' -d '{"target_slave_id":2,"function_code":3,"target_register_addr":100,"target_data_type":1}'
+
+6) PUT /mapping/ranges
+- Body: {"ranges": [{"input_min":<int>,"input_max":<int>,"output_value":<int>}, ...]}
+- Updates mapping ranges. If REG_MAP_RANGES_BASE_ADDR and MAP_MAX_ENTRIES are set, ranges are also written to the device.
+Example:
+
+curl -s -X PUT http://$HTTP_HOST:$HTTP_PORT/mapping/ranges -H 'Content-Type: application/json' -d '{"ranges":[{"input_min":0,"input_max":100,"output_value":1000}]}'
+
+Resilience & Safety
+
+- Background collection loop continuously polls the device for status
+- Automatic reconnect with exponential backoff if the device disconnects
+- Thread‑safe status buffer for fast API responses
+- Operation‑level retries with backoff
+- Graceful shutdown via SIGINT/SIGTERM
+- Logs key events (connect/disconnect, retries, errors, timestamps)
+
+Notes
+
+- Register addresses and value semantics depend on the specific device firmware. Configure them via environment variables as appropriate for your module.
+
+Generated by [IoT Driver Copilot](https://copilot.test.shifu.dev/)
